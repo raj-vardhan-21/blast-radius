@@ -1,0 +1,4 @@
+sqlglot/
+maps/
+output.jsonl
+__pycache__/
