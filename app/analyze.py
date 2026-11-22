@@ -451,6 +451,19 @@ def _find_new_fn(new_tree, old_fn_stack):
     return node
 
 
+def _walk_no_comp(node):
+    """ast.walk that skips comprehension targets (they bind only inside the comprehension)."""
+    todo = [node]
+    while todo:
+        n = todo.pop()
+        yield n
+        if isinstance(n, ast.comprehension):
+            todo.append(n.iter)
+            todo.extend(n.ifs)
+            continue
+        todo.extend(ast.iter_child_nodes(n))
+
+
 def _assigned_names(stmt):
     names = set()
     if stmt is None:
@@ -463,7 +476,7 @@ def _assigned_names(stmt):
             names.add((al.asname or al.name).split(".")[0])
             names.add(al.name.split(".")[-1])
         return names
-    for node in ast.walk(stmt):
+    for node in _walk_no_comp(stmt):
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             names.add(node.id)
         elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -746,6 +759,9 @@ class PyAnalysis:
         fns = [i for i, s in enumerate(r.stack) if isinstance(s, FUNC + (ast.Lambda,))]
         if fns:
             fn = r.stack[fns[-1]]
+            if (r.stack[-1] is fn and fn.body and r.old is fn.body[0] and _is_str_expr(r.old)
+                    and r.new is not None and _is_str_expr(r.new)):
+                return self.doc_users(r.old, r.new)
             nf = _find_new_fn(self.new_tree, r.stack[: fns[-1] + 1])
             whole = nf is None or _fn_signature(fn) != _fn_signature(nf)
             if whole:
@@ -792,13 +808,21 @@ class PyAnalysis:
             return self.names_users(names, cls)
         names = _assigned_names(r.old) | _assigned_names(r.new)
         if all(_is_str_expr(s) for s in (r.old, r.new) if s is not None):
-            # docstrings only surface through __doc__
+            if r.old is not None and r.new is not None:
+                return self.doc_users(r.old, r.new)
             return self.names_users({"__doc__"}, [])
         if not names:
             # bare expression / call at import time
             return M.importers(path)
-        base = self.names_users(names, cls)
-        if r.old is not None and r.new is not None:
+        unbound = 0
+        removed = _assigned_names(r.old) - _assigned_names(r.new)
+        if removed and _loads_any(self.new_tree, removed):
+            # a later read of a name no longer bound here can fail at import
+            self.notes.append("unbound")
+            unbound = M.importers(path)
+        data = all(isinstance(s, (ast.Assign, ast.AnnAssign)) for s in (r.old, r.new) if s is not None)
+        base = self.names_users(names, cls, data) | unbound
+        if r.old is not None and r.new is not None and not unbound:
             changed = _literal_diff(r.old, r.new)
             if changed is not None:
                 feat = _features(changed, M)
@@ -807,8 +831,19 @@ class PyAnalysis:
                     return base & feat
         return base
 
-    def names_users(self, names, cls):
-        """Tests that could observe a module/class level binding of `names`."""
+    def doc_users(self, old, new):
+        # pytest does not collect test_docs' load_tests doctests; the only reader of __doc__
+        # (the Expr metaclass) just checks it for emptiness
+        if bool(old.value.value) == bool(new.value.value):
+            self.notes.append("docstring")
+            return 0
+        return self.names_users({"__doc__"}, [])
+
+    def names_users(self, names, cls, data=False):
+        """Tests that could observe a module/class level binding of `names`.
+
+        With `data`, class/module-level stores and plain imports of the name are not readers.
+        """
         M, path = self.M, self.path
         mod = _module_name(path)
         chain = [mod.split(".")[-1]] + [c.name for c in cls]
@@ -827,7 +862,10 @@ class PyAnalysis:
             if U is not None:
                 fbits &= U
             total |= fbits
-            for owner, qual in r[1]:
+            for ent in r[1]:
+                owner, qual = ent[0], ent[1]
+                if data and len(ent) > 2 and ent[2] in ("s", "i"):
+                    continue
                 ofile, oq = owner.split("::", 1)
                 if qual:
                     if qual.split(".")[-1] != chain[-1]:
@@ -867,6 +905,15 @@ def _scope_inside(oq, clsnames):
 
 def _is_str_expr(s):
     return isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str)
+
+
+def _loads_any(tree, names):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in names and not isinstance(node.ctx, ast.Store):
+            return True
+        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id in names:
+            return True
+    return False
 
 
 CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")

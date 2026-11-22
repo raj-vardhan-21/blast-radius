@@ -3,7 +3,7 @@
 set -e
 S=${1:-$PWD/sample}
 docker build -q --build-arg http_proxy=$http_proxy --build-arg https_proxy=$https_proxy --platform linux/amd64 -t blast-radius-entry . > /dev/null
-docker run --rm --network none --cpus 2 --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+docker run --rm --network none --cpuset-cpus 0-1 --cpus 2 --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
   --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 \
   --env HOME=/tmp -e BR_FAIL_FRAC -e BR_CPU_SCALE -v $S/commits:/data/commits:ro -v $S/tests.json:/data/tests.json:ro \
   blast-radius-entry 2>/tmp/err.txt > output.jsonl

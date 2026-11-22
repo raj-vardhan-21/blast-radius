@@ -89,7 +89,8 @@ def main():
                 files = dict(pl["newfiles"])
                 if pl["unprobed"] == 0 and pl["probes"]:
                     free = pl["cand"] - pl["certain"]
-                    big = {n for n in free if ms[n] >= 1500 or cm.cpu[n] >= 1.5}
+                    # tests far cheaper to run than to list are just run
+                    big = {n for n in free if cm.cpu[n] >= 1.5 and cm.cpu[n] > 0.6 * ms[n] / 1000.0}
                     small = free - big
                     if big and small and cm.run_cpu(small) < 0.75 * cm.static_cost(big):
                         keys = []

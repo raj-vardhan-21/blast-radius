@@ -29,11 +29,25 @@ class V(ast.NodeVisitor):
     def owner(self):
         return self.rel + "::" + ".".join(self.cls)
 
-    def ref(self, ident, node, qual=""):
+    def ref(self, ident, node, qual="", kind="l"):
         if self.fn:
             add(ident, "f", (self.rel, node.lineno))
         else:
-            add(ident, "c", (self.owner(), qual))
+            add(ident, "c", (self.owner(), qual, kind))
+
+    @staticmethod
+    def _kind(node):
+        ctx = getattr(node, "ctx", None)
+        return "s" if isinstance(ctx, (ast.Store, ast.Del)) else "l"
+
+    def visit_AugAssign(self, node):
+        # an augmented target is read as well as written
+        t = node.target
+        if isinstance(t, ast.Name):
+            self.ref(t.id, t)
+        else:
+            self.visit(t)
+        self.visit(node.value)
 
     def visit_ClassDef(self, node):
         for d in node.decorator_list + node.bases + [k.value for k in node.keywords]:
@@ -58,8 +72,14 @@ class V(ast.NodeVisitor):
 
     visit_FunctionDef = visit_AsyncFunctionDef = _fn
 
+    def visit_Lambda(self, node):
+        self.visit(node.args)
+        self.fn += 1
+        self.visit(node.body)
+        self.fn -= 1
+
     def visit_Name(self, node):
-        self.ref(node.id, node)
+        self.ref(node.id, node, kind=self._kind(node))
 
     def visit_Attribute(self, node):
         parts = []
@@ -72,7 +92,7 @@ class V(ast.NodeVisitor):
             qual = ".".join(parts[::-1])
         else:
             qual = "?"
-        self.ref(node.attr, node, qual)
+        self.ref(node.attr, node, qual, self._kind(node))
         self.visit(node.value)
 
     def visit_Constant(self, node):
@@ -80,8 +100,10 @@ class V(ast.NodeVisitor):
             self.ref(node.value, node)
 
     def visit_alias(self, node):
-        self.ref((node.asname or node.name).split(".")[0], node)
-        self.ref(node.name.split(".")[-1], node)
+        # an import that keeps the name only rebinds it; readers are indexed under the same name
+        kind = "i" if not node.asname or node.asname == node.name.split(".")[-1] else "l"
+        self.ref((node.asname or node.name).split(".")[0], node, kind=kind)
+        self.ref(node.name.split(".")[-1], node, kind=kind)
 
 
 for base in ("sqlglot", "tests"):
