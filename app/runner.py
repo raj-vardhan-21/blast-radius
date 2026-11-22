@@ -331,21 +331,42 @@ def _child(overlay, ids, budgets, out_path, abort_on_div=False):
 # ------------------------------------------------------------------ parent side
 
 
-def _lite_child(overlay, out_path):
+def _aux_child(job):
+    """Stand-in checks for the two biggest tests (lite.py); never runs a listed test itself."""
     os.setpgid(0, 0)
-    os.chdir(overlay)
-    sys.path.insert(0, overlay)
+    os.chdir(job.overlay)
+    sys.path.insert(0, job.overlay)
     os.environ["SKIP_INTEGRATION"] = "0"
+    os.cpu_count = lambda: 1
+    if hasattr(os, "process_cpu_count"):
+        os.process_cpu_count = lambda: 1
     import lite
 
-    try:
-        h = lite.artifact()
-    except BaseException as e:  # noqa: BLE001
-        log(f"    lite failed: {e!r}"[:300])
-        h = "error"
-    with open(out_path + ".tmp", "w") as fh:
-        json.dump({"lite": h}, fh)
-    os.rename(out_path + ".tmp", out_path)
+    def on_alarm(signum, frame):
+        raise TestTimeout("aux timed out")
+
+    signal.signal(signal.SIGALRM, on_alarm)
+    res = {}
+    mn_same = False
+    if job.mn is not None:
+        signal.setitimer(signal.ITIMER_REAL, 12)
+        try:
+            mn_same = lite.mn_artifact() == job.mn
+        except BaseException as e:  # noqa: BLE001
+            log(f"    max_nodes artifact failed: {e!r}"[:300])
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        res["mn"] = mn_same
+    if job.tpcds is not None and (job.lite_dropped if mn_same else job.lite_kept):
+        signal.setitimer(signal.ITIMER_REAL, 30)
+        try:
+            res["lite"], res["nq"] = lite.tpcds_check(job.tpcds)
+        except BaseException as e:  # noqa: BLE001
+            log(f"    tpcds check failed: {e!r}"[:300])
+            res["lite"] = "error"
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    with open(job.out + ".tmp", "w") as fh:
+        json.dump(res, fh)
+    os.rename(job.out + ".tmp", job.out)
 
 
 class Job:
@@ -364,8 +385,8 @@ def start(job):
             sys.stdout.flush()
             devnull = os.open(os.devnull, os.O_WRONLY)
             os.dup2(devnull, 1)
-            if getattr(job, "lite", False):
-                _lite_child(job.overlay, job.out)
+            if getattr(job, "aux", False):
+                _aux_child(job)
             else:
                 _child(job.overlay, job.ids, job.budgets, job.out, getattr(job, "abort_on_div", False))
         except BaseException as e:  # noqa: BLE001

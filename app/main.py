@@ -18,37 +18,52 @@ NO_RUN = os.environ.get("BR_NO_RUN") == "1"
 MIN_EXEC = 20
 
 
-def lite_check(plans, sels, by_id, ms, runner, deadline):
-    """Drop test_execute_tpcds where its pre-execution artifacts match the pinned commit's."""
+def aux_check(plans, sels, by_id, ms, runner, deadline):
+    """Drop test_max_nodes / test_execute_tpcds where lite.py shows they behave as at the pinned commit."""
     try:
         with open(os.path.join(HERE, "lite_base.txt")) as f:
-            base = f.read().strip()
+            base = json.load(f)
         with open(os.path.join(HERE, "lite.json")) as f:
             E = json.load(f)
-    except OSError:
+    except (OSError, ValueError):
         return
-    num = by_id.get(E["test"])
-    if not base or num is None:
-        return
+    from lite import MN_TEST, TEST
+
+    num = by_id.get(TEST) if base.get("tpcds") else None
+    num_mn = by_id.get(MN_TEST) if base.get("mn") else None
     lines = {k: set(v) for k, v in E["lines"].items()}
     names = set(E["names"])
+
+    def cost(sel, drop):
+        return pack([(ms[n], n) for n in sel if n not in drop])[0]
+
     jobs = []
     for cid, pl in plans.items():
         L = pl.get("lite")
-        if (not L or not L["ok"] or pl["bad"] or num not in sels[cid] or num in pl["certain"]
-                or num in pl.get("run", ())):
+        if not L or pl["bad"]:
             continue
         sel = sels[cid]
-        # the check costs about 3 s of CPU
-        if pack([(ms[n], n) for n in sel])[0] - pack([(ms[n], n) for n in sel if n != num])[0] < 5000:
+        fixed = pl["certain"] | pl.get("run", set())
+        # test_max_nodes reads nothing but sqlglot's code
+        mn = (num_mn in sel and num_mn not in fixed
+              and all(r.startswith("sqlglot/") and r.endswith(".py") and isinstance(t, str)
+                      for r, t in pl["newfiles"].items()))
+        tp = (num in sel and num not in fixed and L["ok"] and not L["names"] & names
+              and not any(a <= ln <= b for rel, spans in L["spans"].items() for a, b in spans
+                          for ln in lines.get(rel, ())))
+        # the TPC-DS check costs about 3 s of CPU, the max_nodes one about 0.5 s
+        kept = tp and cost(sel, ()) - cost(sel, {num}) >= 5000
+        dropped = tp and mn and cost(sel, {num_mn}) - cost(sel, {num_mn, num}) >= 5000
+        if mn and not dropped and cost(sel, ()) - cost(sel, {num_mn}) < 2000:
+            mn = False
+        if not (mn or kept):
             continue
-        if L["names"] & names:
-            continue
-        if any(a <= ln <= b for rel, spans in L["spans"].items() for a, b in spans for ln in lines.get(rel, ())):
-            continue
-        job = runner.Job(cid + "-lite", None, [], {}, 40.0)
-        job.lite = True
+        job = runner.Job(cid + "-aux", None, [], {}, 60.0)
+        job.aux = True
         job.cid = cid
+        job.mn = base["mn"] if mn else None
+        job.tpcds = base["tpcds"] if tp else None
+        job.lite_kept, job.lite_dropped = kept, dropped
         job.overlay = os.path.join(TMP, "ovl", cid)
         runner.build_overlay(ROOT, job.overlay, pl["newfiles"])
         jobs.append(job)
@@ -57,9 +72,11 @@ def lite_check(plans, sels, by_id, ms, runner, deadline):
     runner.run_jobs(jobs, parallel=2, deadline=deadline)
     shutil.rmtree(os.path.join(TMP, "ovl"), ignore_errors=True)
     for job in jobs:
-        h = (job.result or {}).get("lite")
-        log(f"  {job.cid}: tpcds artifacts {'same' if h == base else 'differ'} ({getattr(job, 'cpu', 0):.2f}s cpu)")
-        if h == base:
+        r = job.result or {}
+        log(f"  {job.cid}: aux {r} ({getattr(job, 'cpu', 0):.2f}s cpu)")
+        if r.get("mn") is True:
+            sels[job.cid].discard(num_mn)
+        if r.get("lite") == "same":
             sels[job.cid].discard(num)
 
 
@@ -206,9 +223,9 @@ def main():
         try:
             import runner
 
-            lite_check(plans, sels, by_id, ms, runner, deadline)
+            aux_check(plans, sels, by_id, ms, runner, deadline)
         except Exception as e:  # noqa: BLE001
-            log(f"lite check failed: {e!r}")
+            log(f"aux check failed: {e!r}")
     out = []
     for patch in patches:
         cid = patch.stem

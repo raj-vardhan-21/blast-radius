@@ -24,6 +24,8 @@ for dp, dn, fn in os.walk(os.path.join(root, "tests/fixtures")):
             fixtures.append(os.path.relpath(os.path.join(dp, f), root))
 py_files.sort()
 fixtures.sort()
+if os.environ.get("MUT_FILES"):
+    py_files = [f for f in py_files if re.search(os.environ["MUT_FILES"], f)]
 test_files = sorted(
     os.path.relpath(os.path.join(dp, f), root)
     for dp, dn, fn in os.walk(os.path.join(root, "tests")) if "fixtures" not in dp

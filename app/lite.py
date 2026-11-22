@@ -1,14 +1,20 @@
-"""TPC-DS executor test without its row execution.
+"""Cheap stand-ins for the two most expensive tests.
 
 test_execute_tpcds parses, pickles, optimizes and plans each query, runs the plan in the
 Python executor and compares with duckdb on transpile(sql). Everything before the row
-execution is hashed here; with an unchanged hash and no change reaching the code the row
-execution runs (dev/trace_exec.py -> lite.json), the test behaves as at the pinned commit.
+execution is hashed here per query; a query with an unchanged hash, when no change reaches
+the code the row execution runs (dev/trace_exec.py -> lite.json), behaves as at the pinned
+commit. Queries whose hash changed are executed for real, the way the test does it.
+
+test_max_nodes parses one very wide statement of identical columns. mn_artifact() hashes
+everything the same steps can observe on a narrower statement.
 """
 import hashlib
 import pickle
+import time
 
 TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+MN_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
 
 
 def _dump(o, out):
@@ -73,18 +79,19 @@ def _dump_plan(plan, out):
     out.append(step_str(plan.root))
 
 
-def artifact():
+def query_hashes():
+    """[(index, hash)] for every TPC-DS query the test executes."""
     from sqlglot import find_tables, parse_one, transpile
     from sqlglot.optimizer import optimize
     from sqlglot.planner import Plan
     from sqlglot.schema import ensure_schema
     from tests.helpers import TPCDS_SCHEMA, load_sql_fixture_pairs
 
-    h = hashlib.sha256()
     list(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
     sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
     schema_blob = pickle.dumps(TPCDS_SCHEMA)
-    for meta, sql, _ in sqls:
+    res = []
+    for i, (meta, sql, _) in enumerate(sqls):
         e = pickle.loads(pickle.dumps(parse_one(sql)))
         if not meta.get("execute"):
             continue
@@ -95,17 +102,82 @@ def artifact():
         _dump(opt, out)
         _dump_plan(Plan(opt), out)
         out.append(transpile(sql, write="duckdb")[0])
-        h.update("\x00".join(out).encode("utf-8", "surrogatepass"))
-    return h.hexdigest()
+        res.append((i, hashlib.sha256("\x00".join(out).encode("utf-8", "surrogatepass")).hexdigest()))
+    return res
+
+
+def tpcds_check(base, max_exec=12, cpu_budget=8.0):
+    """("same"|"differ", number of changed queries). Changed queries are run as the test runs them."""
+    base = set(base)
+    diff = [i for i, h in query_hashes() if h not in base]
+    if not diff:
+        return "same", 0
+    if len(diff) > max_exec:
+        return "differ", len(diff)
+    t0 = time.process_time()
+    import tests.test_executor as te
+    from sqlglot import parse_one
+    from tests.helpers import TPCDS_SCHEMA
+
+    cls = te.TestExecutor
+    cls.setUpClass()
+    case = cls("test_execute_tpcds")
+    te.initializer(*pickle.loads(pickle.dumps((TPCDS_SCHEMA, cls.tpcds_tables))))
+    for i in diff:
+        if time.process_time() - t0 > cpu_budget:
+            return "differ", len(diff)
+        meta, sql, _ = cls.tpcds_sqls[i]
+        fn, args = pickle.loads(pickle.dumps((te.mp_execute, (parse_one(sql), meta))))
+        table = pickle.loads(pickle.dumps(fn(*args)))
+        if table is not None:
+            case.subtestHelper(i, table, tpch=False)
+    return "same", len(diff)
+
+
+def mn_artifact(width=300):
+    """Hash of everything test_max_nodes can observe, on `width` columns instead of 10000."""
+    from sqlglot import parse_one
+    from sqlglot.errors import ParseError
+
+    out = []
+
+    def ok(sql, **kw):
+        e = parse_one(sql, **kw)
+        out.append(type(e).__module__ + "." + type(e).__qualname__)
+        out.append(repr(e))
+
+    def err(sql, **kw):
+        try:
+            parse_one(sql, **kw)
+        except ParseError as e:
+            out.append("ParseError:" + str(e))
+            out.append(repr(e.errors))
+        else:
+            out.append("no error")
+
+    ok("SELECT 1", max_nodes=1_000_000)
+    ok(f"SELECT {','.join(f'col{i}' for i in range(500))} FROM t", max_nodes=1_000_000)
+    expr = "x" + "=x" * 100
+    sql = f"SELECT {','.join(expr for _ in range(width))}"
+    # the test's limits are 1_000_000 and 50_000 on 10000 columns
+    err(sql, max_nodes=30_000)
+    err(sql, max_nodes=1_500)
+    err("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+    ok("SELECT 1, 2, 3")
+    if "no error" in out:
+        raise AssertionError("limit not reached")
+    return hashlib.sha256("\x00".join(out).encode("utf-8", "surrogatepass")).hexdigest()
 
 
 if __name__ == "__main__":
+    import json
     import os
     import sys
 
     root = sys.argv[1]
     sys.path.insert(0, root)
     os.chdir(root)
-    a, b = artifact(), artifact()
-    # only trust the check if it is deterministic
-    print(a if a == b else "")
+    a = {"tpcds": [h for _, h in query_hashes()], "mn": mn_artifact()}
+    b = {"tpcds": [h for _, h in query_hashes()], "mn": mn_artifact()}
+    # only trust what is deterministic
+    print(json.dumps({k: (v if v == b[k] else None) for k, v in a.items()}))
