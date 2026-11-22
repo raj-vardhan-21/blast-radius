@@ -64,7 +64,7 @@ def main():
             bad = any(v is False for v in newfiles.values())
             plans[cid] = {"cand": cand, "certain": certain, "newfiles": newfiles, "bad": bad,
                           "probes": {k: v for k, v in A.probes.items() if v}, "unprobed": A.unprobed,
-                          "cond": set()}
+                          "cond": set(), "trivial": A.data_trivial}
             log(f"  {cid}: {len(cand)} candidates, {len(certain)} certain {notes}")
         except Exception as e:  # never risk a miss on an analysis bug
             log(f"  {cid}: analysis failed: {e!r}; listing everything")
@@ -83,7 +83,7 @@ def main():
                     pl["run"], pl["static"] = set(), set(pl["cand"])
                     continue
                 py = any(r.endswith(".py") for r in pl["newfiles"])
-                p = 0.6 if py else 0.95
+                p = 0.6 if py else (0.15 if pl["trivial"] else 0.95)
                 run, static = decide(cm, pl["cand"], pl["certain"], p)
                 pl["cond"] = set()
                 files = dict(pl["newfiles"])

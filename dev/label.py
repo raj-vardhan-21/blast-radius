@@ -36,17 +36,22 @@ def label(name):
             with open(os.path.join(work, fd["new"]), "w", encoding="utf-8", newline="") as f:
                 f.write(new)
     env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONPATH=work, PYTHONDONTWRITEBYTECODE="1", OMP_NUM_THREADS="1")
-    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-n", "6", "-rA",
-                        "--timeout", "300", "tests"], cwd=work, env=env, capture_output=True, text=True)
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rA",
+                        "--timeout", "120", "tests"], cwd=work, env=env, capture_output=True, text=True)
+    os.makedirs(os.path.dirname(out) + "/logs", exist_ok=True)
+    open(os.path.dirname(out) + f"/logs/{cid}.txt", "w").write(r.stdout[-200000:] + r.stderr[-20000:])
     failing = set()
+    pending = False
     for line in r.stdout.splitlines():
-        if not line.startswith(("FAILED", "ERROR", "SUBFAIL", "SUBERROR")):
+        start = line.startswith(("FAILED", "ERROR", "SUBFAIL", "SUBERROR"))
+        if not start and not pending:
             continue
         pos = line.rfind(" tests/")
-        m = LINE.search(line, pos + 1 if pos >= 0 else 0)
-        if not m:
-            print("UNPARSED", line[:200], file=sys.stderr)
+        m = LINE.search(line, pos + 1 if pos >= 0 else 0) if pos >= 0 or start else None
+        if not m or (pending and not start and m.group(2) is None):
+            pending = pending or start
             continue
+        pending = False
         f, c, meth = m.group(1), m.group(2), m.group(3)
         if c is None:
             failing.update(by_file.get(f, []))
@@ -63,6 +68,11 @@ def label(name):
 
 
 names = sorted(n for n in os.listdir(pdir) if n.endswith(".patch"))
+res = {}
+if os.path.exists(out):
+    res = json.load(open(out))["commits"]
+todo = [n for n in names if n[:-6] not in res]
 with ThreadPoolExecutor(par) as ex:
-    res = dict(ex.map(label, names))
-json.dump({"commits": res}, open(out, "w"), indent=1)
+    for cid, v in ex.map(label, todo):
+        res[cid] = v
+        json.dump({"commits": res}, open(out, "w"), indent=1)

@@ -791,6 +791,9 @@ class PyAnalysis:
                 return M.importers(path)
             return self.names_users(names, cls)
         names = _assigned_names(r.old) | _assigned_names(r.new)
+        if all(_is_str_expr(s) for s in (r.old, r.new) if s is not None):
+            # docstrings only surface through __doc__
+            return self.names_users({"__doc__"}, [])
         if not names:
             # bare expression / call at import time
             return M.importers(path)
@@ -862,6 +865,10 @@ def _scope_inside(oq, clsnames):
     return parts[: len(clsnames)] == clsnames
 
 
+def _is_str_expr(s):
+    return isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str)
+
+
 CODING = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 
 
@@ -901,6 +908,7 @@ class Analysis:
         notes = []
         self.probes = {}
         self.unprobed = 0
+        self.data_trivial = True
         if not files:
             notes.append("empty-patch")
         for fd in files:
@@ -944,6 +952,13 @@ class Analysis:
             if old is not None and old == new and new_text == old_text and not fd["mode"]:
                 continue
             c, cert = self.file_change(new, old_text if old == new else None, new_text)
+            if not new.endswith(".py"):
+                for h in fd["hunks"]:
+                    for l2 in h["lines"]:
+                        if l2[:1] in "+-" and l2[1:].strip() and not l2[1:].startswith("--"):
+                            self.data_trivial = False
+                if old != new or not fd["hunks"]:
+                    self.data_trivial = False
             cand |= c
             if cert:
                 certain |= c

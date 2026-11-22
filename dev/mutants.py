@@ -24,6 +24,12 @@ for dp, dn, fn in os.walk(os.path.join(root, "tests/fixtures")):
             fixtures.append(os.path.relpath(os.path.join(dp, f), root))
 py_files.sort()
 fixtures.sort()
+test_files = sorted(
+    os.path.relpath(os.path.join(dp, f), root)
+    for dp, dn, fn in os.walk(os.path.join(root, "tests")) if "fixtures" not in dp
+    for f in fn if f.endswith(".py")
+)
+WEIGHTS = [int(x) for x in os.environ.get("MUT_WEIGHTS", "70,8,15,7,0,0").split(",")]
 
 SWAPS = [
     (r" == ", " != "), (r" != ", " == "), (r" is not ", " is "), (r" is None", " is not None"),
@@ -44,9 +50,12 @@ made = 0
 tries = 0
 while made < n and tries < n * 200:
     tries += 1
-    kind = rng.choices(["code", "comment", "fixture", "delete"], [70, 8, 15, 7])[0]
+    kind = rng.choices(["code", "comment", "fixture", "delete", "testcode", "docstring"], WEIGHTS)[0]
     if kind == "fixture":
         rel = rng.choice(fixtures)
+    elif kind == "testcode":
+        rel = rng.choice(test_files)
+        kind = "code"
     else:
         rel = rng.choice(py_files)
     src = open(os.path.join(root, rel), encoding="utf-8").read()
@@ -54,6 +63,19 @@ while made < n and tries < n * 200:
     i = rng.randrange(len(lines))
     line = lines[i]
     s = line.strip()
+    if kind == "docstring":
+        if not (s.startswith('"""') and len(s) > 10):
+            continue
+        new = line.replace(" ", "  ", 1) if " " in s else None
+        if new is None:
+            continue
+        lines[i] = new
+        b = "\n".join(lines)
+        cid = f"m{seed}x{made:03d}"
+        with open(os.path.join(out, cid + ".patch"), "w") as f:
+            f.write(diff(rel, src, b))
+        made += 1
+        continue
     if not s or s.startswith("#") or s.startswith('"""') or s.startswith("@"):
         continue
     new = None
