@@ -5,20 +5,23 @@ import os
 from pack import pack
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# share of a run set's listing cost expected to come back as failures
+FAIL_FRAC = float(os.environ.get("BR_FAIL_FRAC", "0.15"))
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.0"))
 
 
 class CostModel:
     def __init__(self, tests):
         with open(os.path.join(HERE, "cpu.json")) as f:
             d = json.load(f)
-        self.base = d["base"] + 0.05
+        self.base = d["base"]
         self.setup = d["setup"]
         self.ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
         self.cpu = {}
         self.cls = {}
         for t in tests:
             c = d["test"].get(t["id"])
-            self.cpu[t["number"]] = (c if c is not None else t["seconds"]) * 1.15 + 0.002
+            self.cpu[t["number"]] = (c if c is not None else t["seconds"]) + 0.002
             f, k, _ = t["id"].split("::")
             self.cls[t["number"]] = f"{f}::{k}"
 
@@ -26,7 +29,7 @@ class CostModel:
         if not nums:
             return 0.0
         classes = {self.cls[n] for n in nums}
-        return self.base + sum(self.cpu[n] for n in nums) + sum(self.setup.get(c, 0.05) for c in classes) * 1.15
+        return self.base + sum(self.cpu[n] for n in nums) + sum(self.setup.get(c, 0.02) for c in classes)
 
     def static_cost(self, nums):
         return pack([(self.ms[n], n) for n in nums])[0] / 1000.0
@@ -36,8 +39,8 @@ class CostModel:
         if static:
             out = self.static_cost(static) + (p * 1.0 if run else 0.0)
         else:
-            out = p * (2.0 + 0.3) if run else 0.0
-        return cpu + out
+            out = p * (2.3 + FAIL_FRAC * max(0.0, self.static_cost(run) - 2.0)) if run else 0.0
+        return cpu * CPU_SCALE + out
 
 
 def decide(cm, cand, forced, p):
