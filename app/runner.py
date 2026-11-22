@@ -16,6 +16,8 @@ DEBUG = os.environ.get("BR_DEBUG") == "1"
 # resident-memory caps (bytes): per job, and for all running jobs together
 JOB_RSS = int(os.environ.get("BR_JOB_RSS", str(2200 << 20)))
 TOTAL_RSS = int(os.environ.get("BR_TOTAL_RSS", str(3000 << 20)))
+# gen-0 GC threshold in children: sqlglot's trees are allocation-heavy and short-lived here
+GC0 = int(os.environ.get("BR_GC", "500000"))
 _PAGE = os.sysconf("SC_PAGE_SIZE")
 
 
@@ -53,6 +55,11 @@ def prewarm():
             __import__(m)
         except Exception as e:  # noqa: BLE001
             log(f"prewarm {m}: {e!r}")
+    import gc
+
+    # children inherit these objects; frozen, their collections neither scan nor dirty them
+    gc.collect()
+    gc.freeze()
 
 
 # ------------------------------------------------------------------ overlay
@@ -279,6 +286,7 @@ def _child(overlay, ids, budgets, out_path, abort_on_div=False):
     import importlib
 
     files = {}
+    frozen = False
     for (f, cls), meths in by_class.items():
         files.setdefault(f, []).append((cls, meths))
     for f, groups in files.items():
@@ -296,6 +304,12 @@ def _child(overlay, ids, budgets, out_path, abort_on_div=False):
                     results[f"{f}::{cls}::{m}"] = "fail"
             continue
         signal.setitimer(signal.ITIMER_REAL, 0)
+        if not frozen:
+            # modules live for the whole child: keep the collector off them
+            import gc
+
+            gc.freeze()
+            frozen = True
         suite = unittest.TestSuite()
         cur_group = []
         for cls, meths in groups:
@@ -382,6 +396,10 @@ def start(job):
     if pid == 0:
         code = 0
         try:
+            if GC0:
+                import gc
+
+                gc.set_threshold(GC0, 10, 10)
             sys.stdout.flush()
             devnull = os.open(os.devnull, os.O_WRONLY)
             os.dup2(devnull, 1)
