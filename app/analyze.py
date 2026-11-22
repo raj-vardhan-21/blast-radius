@@ -518,10 +518,10 @@ def _features(nodes, M):
                     informative = True
             elif isinstance(ch, ast.Constant) and isinstance(ch.value, str):
                 ws = re.findall(r"[A-Z_][A-Z0-9_]*", ch.value.upper())
+                if not ws or any(len(w) < 2 for w in ws):
+                    continue
                 for w in ws:
                     v |= M.word(w)
-                if ws:
-                    informative = True
         if not informative:
             return None
         total |= v
@@ -581,6 +581,127 @@ def _module_name(path):
     return p.replace("/", ".")
 
 
+# ---------------------------------------------------------------- probes
+
+MUTATORS = {
+    "pop", "append", "extend", "add", "remove", "update", "insert", "clear", "discard", "setdefault",
+    "popitem", "send", "throw", "close", "set", "replace", "pop_comments", "transform", "write",
+    "seek", "read", "readline", "next", "__next__", "push", "appendleft", "popleft", "sort", "reverse",
+    "execute", "advance", "_advance", "_retreat", "_match", "_match_set", "_match_text_seq",
+    "_match_texts", "_match_pair", "_parse", "retreat", "_add", "_set", "setattr", "delattr",
+    "exec", "eval", "print", "input", "open", "copy", "deepcopy",
+}
+
+
+def _probe_safe(node):
+    for ch in ast.walk(node):
+        if isinstance(ch, (ast.Yield, ast.YieldFrom, ast.Await, ast.NamedExpr, ast.Starred, ast.Slice,
+                           ast.JoinedStr, ast.Lambda, ast.GeneratorExp)):
+            return False
+        if isinstance(ch, ast.Name) and ch.id in ("super", "__class__", "locals", "vars"):
+            return False
+        if isinstance(ch, ast.Call):
+            f = ch.func
+            name = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else None
+            if name is None or name in MUTATORS or name.startswith(("_parse", "_match", "_advance")):
+                return False
+    return True
+
+
+def _diff_expr(o, n):
+    """Smallest pair of differing expression nodes, ignoring statement bodies."""
+    if type(o) is not type(n):
+        return (o, n) if isinstance(o, ast.expr) and isinstance(n, ast.expr) else None
+    diffs = []
+    for field in o._fields:
+        if isinstance(o, ast.stmt) and field in BODY_FIELDS + ("cases",):
+            continue
+        a = getattr(o, field, None)
+        b = getattr(n, field, None)
+        if isinstance(a, ast.AST) and isinstance(b, ast.AST):
+            if _dump(a) != _dump(b):
+                diffs.append((a, b))
+        elif isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                return (o, n) if isinstance(o, ast.expr) else None
+            for x, y in zip(a, b):
+                if isinstance(x, ast.AST) and isinstance(y, ast.AST):
+                    if _dump(x) != _dump(y):
+                        diffs.append((x, y))
+                elif x != y:
+                    return (o, n) if isinstance(o, ast.expr) else None
+        elif a != b and not (isinstance(a, ast.AST) or isinstance(b, ast.AST)):
+            return (o, n) if isinstance(o, ast.expr) else None
+        elif (a is None) != (b is None):
+            return (o, n) if isinstance(o, ast.expr) else None
+    if len(diffs) == 1:
+        r = _diff_expr(*diffs[0])
+        if r is not None:
+            return r
+    if diffs and isinstance(o, ast.expr):
+        return (o, n)
+    return None
+
+
+def make_probe(o, n, new_src):
+    pair = _diff_expr(o, n)
+    if pair is None:
+        return None
+    eo, en = pair
+    if not (isinstance(eo, ast.expr) and isinstance(en, ast.expr)):
+        return None
+    ctx = getattr(en, "ctx", None)
+    if ctx is not None and not isinstance(ctx, ast.Load):
+        return None
+    # the probed node must not sit inside an f-string, comprehension or lambda of the statement
+    for ch in ast.walk(n):
+        if isinstance(ch, (ast.JoinedStr, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.Lambda)):
+            if any(x is en for x in ast.walk(ch)):
+                return None
+    if not (_probe_safe(eo) and _probe_safe(en)):
+        return None
+    seg = ast.get_source_segment(new_src, en)
+    if seg is None:
+        return None
+    try:
+        old_txt = ast.unparse(eo)
+    except Exception:  # noqa: BLE001
+        return None
+    return {"lineno": en.lineno, "col": en.col_offset, "end_lineno": en.end_lineno,
+            "end_col": en.end_col_offset, "old": old_txt, "new": seg}
+
+
+def apply_probes(text, specs, prefix):
+    """Splice probe calls into source text; returns (text, keys)."""
+    lines = text.split("\n")
+    keys = []
+    done = []
+    for spec in sorted(specs, key=lambda s: (s["lineno"], s["col"]), reverse=True):
+        a = (spec["lineno"], spec["col"])
+        b = (spec["end_lineno"], spec["end_col"])
+        if any(not (b <= d[0] or a >= d[1]) for d in done):
+            return None, []
+        done.append((a, b))
+        k = f"{prefix}:{spec['lineno']}:{spec['col']}"
+        l1 = lines[spec["lineno"] - 1].encode()
+        l2 = lines[spec["end_lineno"] - 1].encode()
+        head = l1[: spec["col"]].decode()
+        tail = l2[spec["end_col"]:].decode()
+        new_lines = spec["new"].split("\n")
+        new_lines[0] = f"__br_probe__({k!r}, lambda: ({spec['old']}), lambda: (" + new_lines[0]
+        new_lines[-1] = new_lines[-1] + "))"
+        new_lines[0] = head + new_lines[0]
+        new_lines[-1] = new_lines[-1] + tail
+        lines[spec["lineno"] - 1: spec["end_lineno"]] = new_lines
+        keys.append(k)
+    out = "\n".join(lines)
+    try:
+        compile(out, prefix, "exec", dont_inherit=True)
+    except SyntaxError:
+        return None, []
+    return out, keys
+
+
 class PyAnalysis:
     def __init__(self, M, path, old_src, new_src):
         self.M = M
@@ -588,6 +709,8 @@ class PyAnalysis:
         self.old_src = old_src
         self.new_src = new_src
         self.notes = []
+        self.probes = []
+        self.unprobed = 0
 
     def run(self):
         M = self.M
@@ -626,9 +749,18 @@ class PyAnalysis:
             nf = _find_new_fn(self.new_tree, r.stack[: fns[-1] + 1])
             whole = nf is None or _fn_signature(fn) != _fn_signature(nf)
             if whole:
+                self.unprobed += 1
                 a, b = _span(fn)
                 return M.span(path, a, b)
+            spec = None
+            if r.old is not None and r.new is not None and type(r.old) is type(r.new):
+                spec = make_probe(r.old, r.new, self.new_src)
+            if spec is None:
+                self.unprobed += 1
+            else:
+                self.probes.append(spec)
             return M.span(path, r.a, r.b)
+        self.unprobed += 1
         # module or class level
         cls = [s for s in r.stack if isinstance(s, ast.ClassDef)]
         stmt = r.old if r.old is not None else r.new
@@ -649,8 +781,7 @@ class PyAnalysis:
             key = _module_name(path) + ":" + ".".join([c.name for c in cls] + [r.old.name])
             u = M.users(key)
             return (u or 0) | self.names_users({r.old.name}, cls)
-        if r.kind == "header":
-            # header of module/class level compound statement (if/try/for/with)
+        if r.kind == "header" and _first_body_line(r.old) is not None:
             names = set()
             for s in (r.old, r.new):
                 for node in ast.walk(s):
@@ -713,16 +844,16 @@ class PyAnalysis:
             if u is not None:
                 return u
             if ofile.startswith("tests/"):
-                return self.test_class_users_by_name(oq.split(".")[0])
+                return self.test_class_users_by_name(oq.split(".")[0], ofile)
         return M.importers(ofile)
 
     def test_class_users(self, cls):
-        return self.test_class_users_by_name(cls[0].name)
+        return self.test_class_users_by_name(cls[0].name, self.path)
 
-    def test_class_users_by_name(self, name):
-        s = self.M.tclass.get(_module_name(self.path) + ":" + name)
+    def test_class_users_by_name(self, name, path):
+        s = self.M.tclass.get(_module_name(path) + ":" + name)
         if s is None:
-            return self.M.importers(self.path)
+            return self.M.importers(path)
         return self.M.sets[s]
 
 
@@ -768,12 +899,15 @@ class Analysis:
         certain = 0
         newfiles = {}
         notes = []
+        self.probes = {}
+        self.unprobed = 0
         if not files:
             notes.append("empty-patch")
         for fd in files:
             old, new = fd["old"], fd["new"]
             rel = new or old
             if fd["binary"]:
+                self.unprobed += 1
                 notes.append(f"binary:{rel}")
                 c = self.file_users(old) | self.file_users(new)
                 cand |= c
@@ -785,6 +919,7 @@ class Analysis:
             if fd["hunks"]:
                 new_text = apply_hunks(old_text if old_text is not None else ("" if old is None else None), fd["hunks"]) if (old_text is not None or old is None) else None
                 if new_text is None:
+                    self.unprobed += 1
                     notes.append(f"apply-failed:{rel}")
                     cand |= self.file_users(old) | self.file_users(new)
                     newfiles[rel] = False
@@ -792,6 +927,7 @@ class Analysis:
             else:
                 new_text = old_text
             if new is None:
+                self.unprobed += 1
                 newfiles[old] = None
                 c = self.file_users(old)
                 if old.endswith(".py"):
@@ -800,6 +936,7 @@ class Analysis:
                 notes.append(f"deleted:{old}")
                 continue
             if old is not None and old != new:
+                self.unprobed += 1
                 newfiles[old] = None
                 cand |= self.file_users(old)
                 notes.append(f"renamed:{old}->{new}")
@@ -828,18 +965,23 @@ class Analysis:
             if old_text is None:
                 # new module: only matters if something imports it (another change would)
                 base = os.path.basename(rel)
+                self.unprobed += 1
                 if base == "conftest.py":
                     return M.ALL, False
                 return 0, False
             pa = PyAnalysis(M, rel, old_text, new_text)
             c, cert = pa.run()
             log(f"  {rel}: {' '.join(pa.notes)[:300]}")
+            self.probes[rel] = pa.probes
+            self.unprobed += pa.unprobed + (1 if cert else 0)
             if _coding(old_text) != _coding(new_text):
+                self.unprobed += 1
                 return M.importers(rel), True
             if pa.notes == ["ast-equal"]:
                 return 0, False
             return c | M.opened_by(rel), cert
         # data files
+        self.unprobed += 1
         c = M.opened_by(rel)
         if rel.startswith("sqlglot/") and not c:
             c = 0
