@@ -7,6 +7,7 @@ RUN python -c "import urllib.request as u; u.urlretrieve('https://github.com/tob
  && mkdir -p /opt/sqlglot && tar xzf /tmp/s.tgz -C /opt/sqlglot --strip-components=1 && rm /tmp/s.tgz \
  && cd /opt/sqlglot && python -m compileall -q sqlglot tests > /dev/null; chmod -R a+rX /opt/sqlglot
 COPY app /app
-RUN chmod -R a+rX /app && python -m compileall -q /app
+RUN python /app/lite.py /opt/sqlglot > /app/lite_base.txt && cat /app/lite_base.txt \
+ && chmod -R a+rX /app && python -m compileall -q /app
 ENV PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 SKIP_INTEGRATION=0
 CMD ["python", "/app/main.py"]

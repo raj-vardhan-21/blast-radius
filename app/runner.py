@@ -331,6 +331,23 @@ def _child(overlay, ids, budgets, out_path, abort_on_div=False):
 # ------------------------------------------------------------------ parent side
 
 
+def _lite_child(overlay, out_path):
+    os.setpgid(0, 0)
+    os.chdir(overlay)
+    sys.path.insert(0, overlay)
+    os.environ["SKIP_INTEGRATION"] = "0"
+    import lite
+
+    try:
+        h = lite.artifact()
+    except BaseException as e:  # noqa: BLE001
+        log(f"    lite failed: {e!r}"[:300])
+        h = "error"
+    with open(out_path + ".tmp", "w") as fh:
+        json.dump({"lite": h}, fh)
+    os.rename(out_path + ".tmp", out_path)
+
+
 class Job:
     def __init__(self, key, overlay, ids, budgets, wall):
         self.key, self.overlay, self.ids, self.budgets, self.wall = key, overlay, ids, budgets, wall
@@ -347,7 +364,10 @@ def start(job):
             sys.stdout.flush()
             devnull = os.open(os.devnull, os.O_WRONLY)
             os.dup2(devnull, 1)
-            _child(job.overlay, job.ids, job.budgets, job.out, getattr(job, "abort_on_div", False))
+            if getattr(job, "lite", False):
+                _lite_child(job.overlay, job.out)
+            else:
+                _child(job.overlay, job.ids, job.budgets, job.out, getattr(job, "abort_on_div", False))
         except BaseException as e:  # noqa: BLE001
             log(f"child crash {e!r}")
             code = 1

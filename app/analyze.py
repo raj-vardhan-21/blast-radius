@@ -724,6 +724,36 @@ class PyAnalysis:
         self.notes = []
         self.probes = []
         self.unprobed = 0
+        # for lite.py: changed function bodies (old line spans) and module/class-level names
+        self.lite_ok = True
+        self.lite_spans = []
+        self.lite_names = set()
+
+    def lite_note(self, r):
+        if all(_is_str_expr(s) for s in (r.old, r.new) if s is not None):
+            return
+        fns = [i for i, s in enumerate(r.stack) if isinstance(s, FUNC + (ast.Lambda,))]
+        if fns:
+            outer = r.stack[fns[0]]
+            if isinstance(outer, ast.Lambda):
+                self.lite_ok = False
+            else:
+                self.lite_spans.append((outer.body[0].lineno, outer.end_lineno))
+            return
+        names = set()
+        for s in (r.old, r.new):
+            if s is None:
+                continue
+            if isinstance(s, ast.ClassDef):
+                self.lite_ok = False
+            for node in ast.walk(s):
+                if isinstance(node, ast.stmt):
+                    names |= _assigned_names(node)
+        if isinstance(r.old, FUNC):
+            self.lite_spans.append((r.old.body[0].lineno, r.old.end_lineno))
+        if not names:
+            self.lite_ok = False
+        self.lite_names |= names
 
     def run(self):
         M = self.M
@@ -749,6 +779,7 @@ class PyAnalysis:
             return 0, False
         cand = 0
         for r in regions:
+            self.lite_note(r)
             c = self.region(r)
             self.notes.append(f"{r!r}:{bin(c).count('1')}")
             cand |= c
@@ -819,6 +850,7 @@ class PyAnalysis:
         if removed and _loads_any(self.new_tree, removed):
             # a later read of a name no longer bound here can fail at import
             self.notes.append("unbound")
+            self.lite_ok = False
             unbound = M.importers(path)
         data = all(isinstance(s, (ast.Assign, ast.AnnAssign)) for s in (r.old, r.new) if s is not None)
         base = self.names_users(names, cls, data) | unbound
@@ -956,11 +988,16 @@ class Analysis:
         self.probes = {}
         self.unprobed = 0
         self.data_trivial = True
+        self.lite = {"ok": bool(files), "spans": {}, "names": set()}
         if not files:
             notes.append("empty-patch")
         for fd in files:
             old, new = fd["old"], fd["new"]
             rel = new or old
+            if (fd["binary"] or fd["mode"] or old != new or not fd["hunks"]
+                    or not (rel.startswith("sqlglot/") and rel.endswith(".py")
+                            or rel.startswith("tests/fixtures/") and rel.endswith(".sql"))):
+                self.lite["ok"] = False
             if fd["binary"]:
                 self.unprobed += 1
                 notes.append(f"binary:{rel}")
@@ -1036,8 +1073,13 @@ class Analysis:
             log(f"  {rel}: {' '.join(pa.notes)[:300]}")
             self.probes[rel] = pa.probes
             self.unprobed += pa.unprobed + (1 if cert else 0)
+            if cert or not pa.lite_ok:
+                self.lite["ok"] = False
+            self.lite["spans"].setdefault(rel, []).extend(pa.lite_spans)
+            self.lite["names"] |= pa.lite_names
             if _coding(old_text) != _coding(new_text):
                 self.unprobed += 1
+                self.lite["ok"] = False
                 return M.importers(rel), True
             if pa.notes == ["ast-equal"]:
                 return 0, False

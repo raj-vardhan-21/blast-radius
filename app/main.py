@@ -18,6 +18,51 @@ NO_RUN = os.environ.get("BR_NO_RUN") == "1"
 MIN_EXEC = 20
 
 
+def lite_check(plans, sels, by_id, ms, runner, deadline):
+    """Drop test_execute_tpcds where its pre-execution artifacts match the pinned commit's."""
+    try:
+        with open(os.path.join(HERE, "lite_base.txt")) as f:
+            base = f.read().strip()
+        with open(os.path.join(HERE, "lite.json")) as f:
+            E = json.load(f)
+    except OSError:
+        return
+    num = by_id.get(E["test"])
+    if not base or num is None:
+        return
+    lines = {k: set(v) for k, v in E["lines"].items()}
+    names = set(E["names"])
+    jobs = []
+    for cid, pl in plans.items():
+        L = pl.get("lite")
+        if (not L or not L["ok"] or pl["bad"] or num not in sels[cid] or num in pl["certain"]
+                or num in pl.get("run", ())):
+            continue
+        sel = sels[cid]
+        # the check costs about 3 s of CPU
+        if pack([(ms[n], n) for n in sel])[0] - pack([(ms[n], n) for n in sel if n != num])[0] < 5000:
+            continue
+        if L["names"] & names:
+            continue
+        if any(a <= ln <= b for rel, spans in L["spans"].items() for a, b in spans for ln in lines.get(rel, ())):
+            continue
+        job = runner.Job(cid + "-lite", None, [], {}, 40.0)
+        job.lite = True
+        job.cid = cid
+        job.overlay = os.path.join(TMP, "ovl", cid)
+        runner.build_overlay(ROOT, job.overlay, pl["newfiles"])
+        jobs.append(job)
+    if not jobs:
+        return
+    runner.run_jobs(jobs, parallel=2, deadline=deadline)
+    shutil.rmtree(os.path.join(TMP, "ovl"), ignore_errors=True)
+    for job in jobs:
+        h = (job.result or {}).get("lite")
+        log(f"  {job.cid}: tpcds artifacts {'same' if h == base else 'differ'} ({getattr(job, 'cpu', 0):.2f}s cpu)")
+        if h == base:
+            sels[job.cid].discard(num)
+
+
 def main():
     t_start = time.monotonic()
     t0 = time.process_time()
@@ -64,7 +109,7 @@ def main():
             bad = any(v is False for v in newfiles.values())
             plans[cid] = {"cand": cand, "certain": certain, "newfiles": newfiles, "bad": bad,
                           "probes": {k: v for k, v in A.probes.items() if v}, "unprobed": A.unprobed,
-                          "cond": set(), "trivial": A.data_trivial}
+                          "cond": set(), "trivial": A.data_trivial, "lite": A.lite}
             log(f"  {cid}: {len(cand)} candidates, {len(certain)} certain {notes}")
         except Exception as e:  # never risk a miss on an analysis bug
             log(f"  {cid}: analysis failed: {e!r}; listing everything")
@@ -134,11 +179,11 @@ def main():
                 pl["run"], pl["static"], pl["cond"] = set(), set(pl["cand"]), set()
             jobs = []
 
-    out = []
+    sels = {}
     for patch in patches:
         cid = patch.stem
         pl = plans[cid]
-        sel = set(pl.get("static", pl["cand"]))
+        sel = sels[cid] = set(pl.get("static", pl["cand"]))
         run = pl.get("run", set())
         if run:
             job = next(j for j in jobs if j.key == cid)
@@ -157,6 +202,17 @@ def main():
                     log(f"  {cid}: probes {stats} -> {'skip' if ok else 'list'} {len(pl['cond'])} big tests")
                     if not ok:
                         sel |= pl["cond"]
+    if not NO_RUN:
+        try:
+            import runner
+
+            lite_check(plans, sels, by_id, ms, runner, deadline)
+        except Exception as e:  # noqa: BLE001
+            log(f"lite check failed: {e!r}")
+    out = []
+    for patch in patches:
+        cid = patch.stem
+        sel = sels[cid]
         _, workers = pack([(ms[n], n) for n in sel])
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("".join(line + "\n" for line in out))
