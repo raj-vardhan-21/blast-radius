@@ -13,6 +13,18 @@ import time
 
 TMP = os.environ.get("BR_TMP", "/tmp")
 DEBUG = os.environ.get("BR_DEBUG") == "1"
+# resident-memory caps (bytes): per job, and for all running jobs together
+JOB_RSS = int(os.environ.get("BR_JOB_RSS", str(2200 << 20)))
+TOTAL_RSS = int(os.environ.get("BR_TOTAL_RSS", str(3000 << 20)))
+_PAGE = os.sysconf("SC_PAGE_SIZE")
+
+
+def _rss(pid):
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            return int(f.read().split()[1]) * _PAGE
+    except (OSError, ValueError, IndexError):
+        return 0
 
 
 def _dbg(test, err):
@@ -368,16 +380,25 @@ def run_jobs(jobs, parallel=2, deadline=None):
             pid = 0
         if pid == 0:
             now = time.monotonic()
+            rss = {j.pid: _rss(j.pid) for j in active.values()}
             for j in list(active.values()):
                 if now - j.t0 > j.wall or (deadline is not None and now > deadline + 5):
                     log(f"  job {j.key} over wall budget; killing")
                     _kill(j.pid)
+                elif rss[j.pid] > JOB_RSS:
+                    log(f"  job {j.key} rss {rss[j.pid] >> 20}MB; killing")
+                    _kill(j.pid)
+            if sum(rss.values()) > TOTAL_RSS:
+                worst = max(rss, key=rss.get)
+                log(f"  total rss {sum(rss.values()) >> 20}MB; killing job {active[worst].key}")
+                _kill(worst)
             time.sleep(0.01)
             continue
         j = active.pop(pid, None)
         if j is None:
             continue
         j.cpu = ru.ru_utime + ru.ru_stime
+        j.maxrss = ru.ru_maxrss
         _kill(pid)
         try:
             with open(j.out) as fh:

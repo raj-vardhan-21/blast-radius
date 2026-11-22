@@ -35,7 +35,7 @@ for j in jobs:
     rec = sum(t["seconds"] for t in groups[j.ids[0].split("::")[0]])
     st = j.result["results"] if j.result else {}
     bad = {k: v for k, v in st.items() if v != "pass"}
-    print(f"{j.key:50} cpu={jc:7.2f} rec={rec:7.2f} bad={bad}", file=sys.stderr)
+    print(f"{j.key:50} rss={getattr(j, 'maxrss', 0)//1024}MB cpu={jc:7.2f} rec={rec:7.2f} bad={bad}", file=sys.stderr)
     res[j.key] = {"cpu": jc, "rec": rec, "res": st, "tcpu": j.result["cpu"] if j.result else {}}
 c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
 print("children cpu", c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime, "wall", time.time() - t0, file=sys.stderr)
